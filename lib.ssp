@@ -411,16 +411,16 @@ fn compute_owned[e](s: Shared, key: Str, owner: Str, ttl_ms: Int, compute: () ->
   v
 | none => do
   v = compute()
-  n = shared_put(s, key, v, now_ms(), ttl_ms)
+  n = shared_put(s, key, v, now_ms(), max(0, ttl_ms))
   release(s, key, owner)
   v
 
-// The value of `key`, computed by `compute` (and stored for `ttl_ms`, 0 for no expiry) when it is
+// The value of `key`, computed by `compute` (and stored for `ttl_ms`, 0 or less for no expiry) when it is
 // missing, with single-flight: of the callers that miss at the same time, in this process or any
 // other sharing the database, one takes a lease and computes while the others wait and get its
 // result. A waiter that waits longer than `f.wait_ms` computes the value itself. When a computer
 // crashes or `compute` raises, its lease runs out after `f.lease_ms` and the next caller takes over.
-pub fn fetch[e](s: Shared, key: Str, ttl_ms: Int where _ >= 0, f: Flight, compute: () -> Str ! e) -> Str ! db, fail[DbErr], time, rand, div, e
+pub fn fetch[e](s: Shared, key: Str, ttl_ms: Int, f: Flight, compute: () -> Str ! e) -> Str ! db, fail[DbErr], time, rand, div, e
 = do
   owner = crypto.token(12)
   start = now_ms()
@@ -436,19 +436,19 @@ pub fn fetch[e](s: Shared, key: Str, ttl_ms: Int where _ >= 0, f: Flight, comput
 fn compute_fallback[e](s: Shared, key: Str, ttl_ms: Int, compute: () -> Str ! e) -> Str ! db, fail[DbErr], time, e
 = do
   v = compute()
-  n = shared_put(s, key, v, now_ms(), ttl_ms)
+  n = shared_put(s, key, v, now_ms(), max(0, ttl_ms))
   v
 
 // `fetch` for a JSON-encodable type: computes a `T`, stores its JSON, and decodes a cached value
 // with `decode`; a cached value that doesn't decode is computed again.
-pub fn fetch_as[T: Json, e](s: Shared, key: Str, ttl_ms: Int where _ >= 0, f: Flight, compute: () -> T ! e, decode: Str -> Opt[T]) -> T ! db, fail[DbErr], time, rand, div, e
+pub fn fetch_as[T: Json, e](s: Shared, key: Str, ttl_ms: Int, f: Flight, compute: () -> T ! e, decode: Str -> Opt[T]) -> T ! db, fail[DbErr], time, rand, div, e
 = do
   text = fetch(s, key, ttl_ms, f, () => compute().to_json)
   match decode(text)
   | some(v) => v
   | none => do
     v = compute()
-    n = shared_put(s, key, v.to_json, now_ms(), ttl_ms)
+    n = shared_put(s, key, v.to_json, now_ms(), max(0, ttl_ms))
     v
 
 // ---------- HTTP: entity tags ----------
@@ -1361,3 +1361,14 @@ fn served(tier: Str) -> Bool ! proc, env, net, time, div, fs, conc
 test integration_native = served("native")
 
 test integration_interp = served("interp")
+
+test precondition_failed_fields = do
+  r = precondition_failed(Validators{etag: some(weak_etag("z")), last_modified: none})
+  bare = precondition_failed(Validators{etag: none, last_modified: none})
+  r.status == 412 and r.header("etag") == some("W/\"z\"") and r.header("cache-control") == some("no-store") and bare.header("etag") == none
+
+test fetch_negative_ttl_never_expires = catch do
+  s = mem_shared(5)
+  v = fetch(s, "k", -5, flight(), () => "v")
+  v == "v" and shared_peek(s, "k", 999999999999) == some("v")
+| _ => false
