@@ -1,0 +1,5 @@
+[package]
+name = "cache"
+version = "0.1.0"
+description = "Caching for services: immutable LRU and TTL caches with stats, a shared SQLite cache with single-flight, and HTTP caching (ETags, conditional requests, Cache-Control)"
+license = "MIT"

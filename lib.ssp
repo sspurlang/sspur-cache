@@ -1,0 +1,1363 @@
+// Caching for services. Three parts: an immutable LRU cache value with optional per-entry
+// time to live, a cost bound and statistics, for one thread of work (a batch, a request, a
+// worker loop); a cache in SQLite that concurrent http.serve handlers and several processes
+// share, with LRU eviction, expiry, statistics and get_or_compute with single-flight; and HTTP
+// caching after RFC 9110 and RFC 9111: entity tags, HTTP dates, conditional requests (304 and
+// 412), Cache-Control, Vary and Age, and a handler wrapper for conditional GET.
+
+// ---------- the immutable cache ----------
+
+// How a cache is bounded: at most `capacity` entries and, when `max_cost` is above 0, a total cost
+// of at most `max_cost` (each entry's cost is given when it is put; 1 by default). `ttl_ms` above 0
+// is the default time to live; `refresh_on_get` restarts an entry's time to live when it is read
+// (expire after access instead of after write).
+pub type Config = {capacity: Int where _ >= 1, max_cost: Int where _ >= 0, ttl_ms: Int where _ >= 0, refresh_on_get: Bool} derive Eq, Show
+
+// Counters of what a cache did: reads that found a live entry and reads that didn't, writes,
+// entries evicted for room, and entries dropped because they had expired.
+pub type Stats = {hits: Int, misses: Int, puts: Int, evictions: Int, expirations: Int} derive Eq, Show, Json
+
+// One cached value with its recency tick, its expiry time (none for never), its time to live and
+// its cost.
+pub type Entry[V] = {value: V, tick: Int, expires_ms: Opt[Int], ttl_ms: Int, cost: Int} derive Eq, Show
+
+// An immutable LRU cache from K to V. Every operation returns the new cache; reads that change
+// recency or statistics return it too. Operations are O(log n). The least recently used live
+// entry is evicted first, after any expired ones.
+pub type Cache[K, V] = {config: Config, entries: Map[K, Entry[V]], order: Set[(Int, K)], expiry: Set[(Int, Int, K)], tick: Int, cost: Int, stats: Stats} derive Eq, Show
+
+// A configuration bounded by `capacity` entries only.
+pub fn config(capacity: Int where _ >= 1) -> Config
+  ex config(100) == Config{capacity: 100, max_cost: 0, ttl_ms: 0, refresh_on_get: false}
+= Config{capacity, max_cost: 0, ttl_ms: 0, refresh_on_get: false}
+
+// An empty cache with configuration `cfg`.
+pub fn new[K, V](cfg: Config) -> Cache[K, V]
+= Cache{config: cfg, entries: empty_map(), order: empty_set(), expiry: empty_set(), tick: 0, cost: 0, stats: Stats{hits: 0, misses: 0, puts: 0, evictions: 0, expirations: 0}}
+
+// An empty LRU cache of at most `capacity` entries.
+pub fn lru[K, V](capacity: Int where _ >= 1) -> Cache[K, V]
+  post r.config.capacity == capacity and r.entries.len == 0
+= new(config(capacity))
+
+// An empty LRU cache of at most `capacity` entries that each live `ttl_ms` after they are written.
+pub fn ttl_lru[K, V](capacity: Int where _ >= 1, ttl_ms: Int where _ >= 1) -> Cache[K, V]
+  post r.config.ttl_ms == ttl_ms
+= new(config(capacity) with ttl_ms := ttl_ms)
+
+// The number of entries, live or expired but not yet dropped.
+pub fn size[K, V](c: Cache[K, V]) -> Int
+  post r >= 0
+= c.entries.len
+
+// The total cost of the entries.
+pub fn total_cost[K, V](c: Cache[K, V]) -> Int
+  post r >= 0
+= c.cost
+
+// The fraction of reads that hit, 0.0 before any read.
+pub fn hit_rate(s: Stats) -> F64
+  ex hit_rate(Stats{hits: 3, misses: 1, puts: 0, evictions: 0, expirations: 0}) == 0.75
+= if s.hits + s.misses == 0 then 0.0 else s.hits.to_f64 / (s.hits + s.misses).to_f64
+
+fn live[V](e: Entry[V], now_ms: Int) -> Bool
+= match e.expires_ms
+| some(t) => now_ms < t
+| none => true
+
+fn unlink[K, V](c: Cache[K, V], k: K, e: Entry[V]) -> Cache[K, V]
+= c with entries := c.entries.remove(k), order := c.order.remove((e.tick, k)), expiry := unexpire(c.expiry, k, e), cost := c.cost - e.cost
+
+fn unexpire[K, V](s: Set[(Int, Int, K)], k: K, e: Entry[V]) -> Set[(Int, Int, K)]
+= match e.expires_ms
+| some(t) => s.remove((t, e.tick, k))
+| none => s
+
+fn link[K, V](c: Cache[K, V], k: K, e: Entry[V]) -> Cache[K, V]
+= c with entries := c.entries.put(k, e), order := c.order.add((e.tick, k)), expiry := match e.expires_ms
+| some(t) => c.expiry.add((t, e.tick, k))
+| none => c.expiry, cost := c.cost + e.cost
+
+// The value for `k` if it is there and live, without touching recency or statistics.
+pub fn peek[K, V](c: Cache[K, V], k: K, now_ms: Int) -> Opt[V]
+  ex peek(put(lru(2), "a", 1, 0), "a", 0) == some(1)
+= match c.entries.get(k)
+| some(e) => if live(e, now_ms) then some(e.value) else none
+| none => none
+
+// Whether `k` has a live entry.
+pub fn has[K, V](c: Cache[K, V], k: K, now_ms: Int) -> Bool
+  ex not has(lru(2), "a", 0)
+= peek(c, k, now_ms).is_some
+
+// Reads `k`: the value of a live entry, which becomes the most recently used (and with
+// `refresh_on_get` gets a new expiry), counted as a hit; otherwise none, counted as a miss, and
+// an expired entry is dropped.
+pub fn get[K, V](c: Cache[K, V], k: K, now_ms: Int) -> (Opt[V], Cache[K, V])
+  ex get(put(lru(2), "a", 1, 0), "a", 0).0 == some(1)
+= match c.entries.get(k)
+| none => (none, c with stats.misses := c.stats.misses + 1)
+| some(e) => if live(e, now_ms) then (some(e.value), bump(c with stats.hits := c.stats.hits + 1, k, e, now_ms, c.config.refresh_on_get)) else (none, unlink(c, k, e) with stats.misses := c.stats.misses + 1, stats.expirations := c.stats.expirations + 1)
+
+fn bump[K, V](c: Cache[K, V], k: K, e: Entry[V], now_ms: Int, refresh: Bool) -> Cache[K, V]
+= do
+  c1 = unlink(c, k, e)
+  exp = if refresh and e.ttl_ms > 0 then some(now_ms.saturating_add(e.ttl_ms)) else e.expires_ms
+  link(c1 with tick := c.tick + 1, k, e with tick := c.tick + 1, expires_ms := exp)
+
+// Marks `k` as just used and restarts its time to live, without reading it (and without counting
+// a hit). Missing or expired keys are left alone.
+pub fn touch[K, V](c: Cache[K, V], k: K, now_ms: Int) -> Cache[K, V]
+  ex lru_key(touch(put(put(lru(3), "a", 1, 0), "b", 2, 0), "a", 0)) == some("b")
+= match c.entries.get(k)
+| some(e) => if live(e, now_ms) then bump(c, k, e, now_ms, true) else c
+| none => c
+
+// Writes `k` with the default time to live and a cost of 1, evicting what must go.
+pub fn put[K, V](c: Cache[K, V], k: K, v: V, now_ms: Int) -> Cache[K, V]
+  ex size(put(put(lru(1), "a", 1, 0), "b", 2, 0)) == 1
+= insert(c, k, v, now_ms, default_ttl(c), 1).0
+
+// Writes `k` to live `ttl_ms` milliseconds.
+pub fn put_ttl[K, V](c: Cache[K, V], k: K, v: V, now_ms: Int, ttl_ms: Int where _ >= 1) -> Cache[K, V]
+  ex peek(put_ttl(lru(2), "a", 1, 0, 10), "a", 10) == none
+= insert(c, k, v, now_ms, some(ttl_ms), 1).0
+
+fn default_ttl[K, V](c: Cache[K, V]) -> Opt[Int]
+= if c.config.ttl_ms > 0 then some(c.config.ttl_ms) else none
+
+// Writes `k` with a time to live (none: it never expires, whatever the default) and a cost, and
+// returns the entries that left to make room or because they had expired, so the caller can
+// release them. An entry that costs more than `max_cost` is not stored, and an older entry for `k`
+// is removed.
+pub fn insert[K, V](c: Cache[K, V], k: K, v: V, now_ms: Int, ttl_ms: Opt[Int], cost: Int where _ >= 0) -> (Cache[K, V], List[(K, V)])
+  post r.0.entries.len <= r.0.config.capacity
+  ex insert(put(lru(1), "a", 1, 0), "b", 2, 0, none, 1).1 == [("a", 1)]
+= do
+  c0 = match c.entries.get(k)
+  | some(old) => unlink(c, k, old)
+  | none => c
+  c1 = c0 with stats.puts := c.stats.puts + 1
+  if c.config.max_cost > 0 and cost > c.config.max_cost then (c1, []) else do
+    t = c1.tick + 1
+    exp = ttl_ms.map(ms => now_ms.saturating_add(max(0, ms)))
+    e = Entry{value: v, tick: t, expires_ms: exp, ttl_ms: ttl_ms.or(0), cost}
+    (c2, gone) = make_room(c1 with tick := t, now_ms, cost)
+    (link(c2, k, e), gone)
+
+fn over[K, V](c: Cache[K, V], extra: Int) -> Bool
+= c.entries.len + 1 > c.config.capacity or c.config.max_cost > 0 and c.cost + extra > c.config.max_cost
+
+// Makes room for one more entry of cost `extra`: drops expired entries, then the least recently
+// used ones.
+fn make_room[K, V](c: Cache[K, V], now_ms: Int, extra: Int) -> (Cache[K, V], List[(K, V)])
+= do
+  (c1, expired) = if over(c, extra) then drop_expired(c, now_ms) else (c, [])
+  (c2, evicted) = evict(c1, extra, [])
+  (c2, expired + evicted)
+
+fn evict[K, V](c: Cache[K, V], extra: Int, out: List[(K, V)]) -> (Cache[K, V], List[(K, V)])
+= if not over(c, extra) then (c, out) else match pop_lru(c)
+| some((c1, kv)) => evict(c1, extra, out.push(kv))
+| none => (c, out)
+
+// Evicts the least recently used entry.
+fn pop_lru[K, V](c: Cache[K, V]) -> Opt[(Cache[K, V], (K, V))]
+= match c.order.min
+| some((_, k)) => c.entries.get(k).map(e => (unlink(c, k, e) with stats.evictions := c.stats.evictions + 1, (k, e.value)))
+| none => none
+
+fn drop_expired[K, V](c: Cache[K, V], now_ms: Int) -> (Cache[K, V], List[(K, V)])
+= expire_from(c, now_ms, [])
+
+fn expire_from[K, V](c: Cache[K, V], now_ms: Int, out: List[(K, V)]) -> (Cache[K, V], List[(K, V)])
+= match c.expiry.min
+| some((t, _, k)) => if t > now_ms then (c, out) else expire_one(c, now_ms, k, out)
+| none => (c, out)
+
+fn expire_one[K, V](c: Cache[K, V], now_ms: Int, k: K, out: List[(K, V)]) -> (Cache[K, V], List[(K, V)])
+= match c.entries.get(k)
+| some(e) => expire_from(unlink(c, k, e) with stats.expirations := c.stats.expirations + 1, now_ms, out.push((k, e.value)))
+| none => (c, out)
+
+// Drops every entry that has expired by `now_ms`; returns the cache and the dropped entries.
+pub fn purge_expired[K, V](c: Cache[K, V], now_ms: Int) -> (Cache[K, V], List[(K, V)])
+  ex purge_expired(put_ttl(lru(2), "a", 1, 0, 5), 5).1 == [("a", 1)]
+= drop_expired(c, now_ms)
+
+// Removes `k` (not counted as an eviction).
+pub fn remove[K, V](c: Cache[K, V], k: K) -> Cache[K, V]
+  ex size(remove(put(lru(2), "a", 1, 0), "a")) == 0
+= match c.entries.get(k)
+| some(e) => unlink(c, k, e)
+| none => c
+
+// Removes `k` and returns its value if it was live.
+pub fn take[K, V](c: Cache[K, V], k: K, now_ms: Int) -> (Opt[V], Cache[K, V])
+  ex take(put(lru(2), "a", 1, 0), "a", 0) == (some(1), remove(put(lru(2), "a", 1, 0), "a"))
+= (peek(c, k, now_ms), remove(c, k))
+
+// Removes every entry, keeping the configuration and the statistics.
+pub fn clear[K, V](c: Cache[K, V]) -> Cache[K, V]
+  post r.entries.len == 0
+= c with entries := empty_map(), order := empty_set(), expiry := empty_set(), cost := 0
+
+// Changes the bounds, evicting least recently used entries until the cache fits; returns the
+// evicted entries too.
+pub fn resize[K, V](c: Cache[K, V], capacity: Int where _ >= 1, max_cost: Int where _ >= 0) -> (Cache[K, V], List[(K, V)])
+  post r.0.entries.len <= capacity
+  ex size(resize(put(put(lru(5), "a", 1, 0), "b", 2, 0), 1, 0).0) == 1
+= shrink(c with config.capacity := capacity, config.max_cost := max_cost, [])
+
+fn shrink[K, V](c: Cache[K, V], out: List[(K, V)]) -> (Cache[K, V], List[(K, V)])
+= if c.entries.len <= c.config.capacity and (c.config.max_cost == 0 or c.cost <= c.config.max_cost) then (c, out) else match pop_lru(c)
+| some((c1, kv)) => shrink(c1, out.push(kv))
+| none => (c, out)
+
+// The keys, most recently used first (expired ones not yet dropped included).
+pub fn keys[K, V](c: Cache[K, V]) -> List[K]
+  ex keys(put(put(lru(3), "a", 1, 0), "b", 2, 0)) == ["b", "a"]
+= c.order.items.reverse.map(x => x.1)
+
+// The live entries at `now_ms`, most recently used first.
+pub fn items[K, V](c: Cache[K, V], now_ms: Int) -> List[(K, V)]
+  ex items(put(put(lru(3), "a", 1, 0), "b", 2, 0), 0) == [("b", 2), ("a", 1)]
+= keys(c).flat_map(k => peek(c, k, now_ms).map(v => [(k, v)]).or([]))
+
+// The key that would be evicted next (the least recently used).
+pub fn lru_key[K, V](c: Cache[K, V]) -> Opt[K]
+  ex lru_key(put(put(lru(3), "a", 1, 0), "b", 2, 0)) == some("a")
+= c.order.min.map(x => x.1)
+
+// The most recently used key.
+pub fn mru_key[K, V](c: Cache[K, V]) -> Opt[K]
+  ex mru_key(put(put(lru(3), "a", 1, 0), "b", 2, 0)) == some("b")
+= c.order.max.map(x => x.1)
+
+// The milliseconds `k` has left to live: none if it is missing, expired or never expires.
+pub fn ttl_left[K, V](c: Cache[K, V], k: K, now_ms: Int) -> Opt[Int]
+  ex ttl_left(put_ttl(lru(2), "a", 1, 0, 100), "a", 40) == some(60)
+= match c.entries.get(k)
+| some(e) => if live(e, now_ms) then e.expires_ms.map(t => t - now_ms) else none
+| none => none
+
+// The value for `k`, computed by `f` and stored when it is missing or expired.
+pub fn get_or_compute[K, V, e](c: Cache[K, V], k: K, now_ms: Int, f: K -> V ! e) -> (V, Cache[K, V]) ! e
+  ex get_or_compute(lru(2), "a", 0, k => k.len).0 == 1
+= match get(c, k, now_ms)
+| (some(v), c1) => (v, c1)
+| (none, c1) => do
+  v = f(k)
+  (v, put(c1, k, v, now_ms))
+
+// The statistics.
+pub fn stats[K, V](c: Cache[K, V]) -> Stats
+= c.stats
+
+// ---------- a shared cache in SQLite ----------
+
+// A cache of text values in a SQLite table, shared by the concurrent handlers of a server (the
+// Db is shared; a ":memory:" database is one connection) and by processes that open the same
+// file. Every operation is a transaction, so reads and writes from anywhere stay consistent. It
+// keeps at most `capacity` entries, evicting expired ones first and then the least recently used
+// (each read records its use, so a read is a small write). Values are `Str`: a library can't decode
+// JSON into a type parameter, so store `json.encode(x)` and decode on the way out (`shared_get_as` and
+// `shared_put_as` do it with a decoder you pass). Statistics are kept in the database too.
+pub type Shared = {db: Db, table: Str, capacity: Int} derive Eq, Show
+
+// How `fetch` waits for another caller computing the same key: the lease a computer holds (when
+// it crashes or raises, others take over after it), how long a waiter waits before computing the
+// value itself, and how often it looks.
+pub type Flight = {lease_ms: Int where _ >= 1, wait_ms: Int where _ >= 0, poll_ms: Int where _ >= 1} derive Eq, Show
+
+type Row = {value: Str, expires_ms: Opt[Int]}
+
+// Whether `s` can name the cache's tables: a letter or underscore, then letters, digits and
+// underscores, at most 50 characters (the tables get suffixes).
+pub fn valid_table_name(s: Str) -> Bool
+  ex valid_table_name("page_cache") and not valid_table_name("x; drop table y") and not valid_table_name("9x")
+= s.len >= 1 and s.len <= 50 and s.chars.all(c => c.byte_len == 1 and (c.is_alpha or c == "_" or "0123456789".contains(c))) and not "0123456789".contains(s.take(1))
+
+// Opens the cache `table` in `c` with room for `capacity` entries, creating its tables when
+// missing (`table`, `table_meta` for the statistics and `table_leases` for single-flight).
+pub fn shared(c: Db, table: Str where valid_table_name(_), capacity: Int where _ >= 1) -> Shared ! db, fail[DbErr]
+  post r.table == table and r.capacity == capacity
+= do
+  n = db.exec(c, "create table if not exists {table} (key text primary key, value text not null, expires_ms integer, used integer not null); create index if not exists {table}_used on {table} (used); create index if not exists {table}_expiry on {table} (expires_ms); create table if not exists {table}_meta (name text primary key, n integer not null); insert or ignore into {table}_meta (name, n) values ('tick', 0), ('hits', 0), ('misses', 0), ('puts', 0), ('evictions', 0), ('expirations', 0); create table if not exists {table}_leases (key text primary key, owner text not null, expires_ms integer not null)")
+  Shared{db: c, table, capacity}
+
+// The default single-flight settings: 30 s leases, waiters wait up to 30 s, polling every 10 ms.
+pub fn flight() -> Flight
+  post r.lease_ms == 30000
+= Flight{lease_ms: 30000, wait_ms: 30000, poll_ms: 10}
+
+fn bump_meta(s: Shared, name: Str, by: Int) -> Unit ! db, fail[DbErr]
+= if by != 0 then do
+  n = db.exec(s.db, "update {s.table}_meta set n = n + ? where name = ?", [by, name])
+  ()
+
+fn next_tick(s: Shared) -> Int ! db, fail[DbErr]
+= db.one[Int](s.db, "update {s.table}_meta set n = n + 1 where name = 'tick' returning n", [])
+
+fn row(s: Shared, key: Str) -> Opt[Row] ! db, fail[DbErr]
+= db.opt[Row](s.db, "select value, expires_ms from {s.table} where key = ?", [key])
+
+fn alive(r: Row, now_ms: Int) -> Bool
+= match r.expires_ms
+| some(t) => now_ms < t
+| none => true
+
+fn lookup(s: Shared, key: Str, now_ms: Int) -> Opt[Str] ! db, fail[DbErr]
+= match row(s, key)
+| none => do
+  bump_meta(s, "misses", 1)
+  none
+| some(r) => if alive(r, now_ms) then do
+    n = db.exec(s.db, "update {s.table} set used = ? where key = ?", [next_tick(s), key])
+    bump_meta(s, "hits", 1)
+    some(r.value)
+  else do
+    n = db.exec(s.db, "delete from {s.table} where key = ?", [key])
+    bump_meta(s, "misses", 1)
+    bump_meta(s, "expirations", 1)
+    none
+
+// Reads `key`: its value when it is there and live (now the most recently used), counted as a
+// hit; otherwise none, counted as a miss (an expired entry is deleted).
+pub fn shared_get(s: Shared, key: Str, now_ms: Int) -> Opt[Str] ! db, fail[DbErr]
+= db.tx(s.db, () => lookup(s, key, now_ms))
+
+// The value of `key` if it is live, reading only: no recency, no statistics.
+pub fn shared_peek(s: Shared, key: Str, now_ms: Int) -> Opt[Str] ! db, fail[DbErr]
+= row(s, key).map(r => if alive(r, now_ms) then some(r.value) else none).or(none)
+
+fn store(s: Shared, key: Str, value: Str, now_ms: Int, ttl_ms: Int) -> Int ! db, fail[DbErr]
+= do
+  exp = if ttl_ms > 0 then some(now_ms.saturating_add(ttl_ms)) else none
+  n = db.exec(s.db, "insert into {s.table} (key, value, expires_ms, used) values (?, ?, ?, ?) on conflict (key) do update set value = excluded.value, expires_ms = excluded.expires_ms, used = excluded.used", [key, value, exp, next_tick(s)])
+  bump_meta(s, "puts", 1)
+  over = db.one[Int](s.db, "select count(*) from {s.table}", []) - s.capacity
+  if over <= 0 then 0 else do
+    expired = db.exec(s.db, "delete from {s.table} where key in (select key from {s.table} where expires_ms <= ? and key != ? order by expires_ms limit ?)", [now_ms, key, over])
+    bump_meta(s, "expirations", expired)
+    rest = over - expired
+    evicted = if rest > 0 then db.exec(s.db, "delete from {s.table} where key in (select key from {s.table} where key != ? order by used limit ?)", [key, rest]) else 0
+    bump_meta(s, "evictions", evicted)
+    expired + evicted
+
+// Writes `key` to live `ttl_ms` milliseconds (0: until evicted); returns how many entries left to
+// make room (expired ones first, then the least recently used).
+pub fn shared_put(s: Shared, key: Str, value: Str, now_ms: Int, ttl_ms: Int where _ >= 0) -> Int ! db, fail[DbErr]
+  post r >= 0
+= db.tx(s.db, () => store(s, key, value, now_ms, ttl_ms))
+
+// Deletes `key`: whether it was there.
+pub fn shared_delete(s: Shared, key: Str) -> Bool ! db, fail[DbErr]
+= db.exec(s.db, "delete from {s.table} where key = ?", [key]) > 0
+
+// Deletes every entry; returns how many there were. Statistics are kept.
+pub fn shared_clear(s: Shared) -> Int ! db, fail[DbErr]
+  post r >= 0
+= db.exec(s.db, "delete from {s.table}", [])
+
+// Deletes the entries that have expired by `now_ms`; returns how many.
+pub fn shared_purge(s: Shared, now_ms: Int) -> Int ! db, fail[DbErr]
+  post r >= 0
+= db.tx(s.db, () => do
+  n = db.exec(s.db, "delete from {s.table} where expires_ms <= ?", [now_ms])
+  bump_meta(s, "expirations", n)
+  n)
+
+// The number of entries, live or expired but not yet deleted.
+pub fn shared_count(s: Shared) -> Int ! db, fail[DbErr]
+  post r >= 0
+= db.one[Int](s.db, "select count(*) from {s.table}", [])
+
+fn meta(s: Shared, name: Str) -> Int ! db, fail[DbErr]
+= db.opt[Int](s.db, "select n from {s.table}_meta where name = ?", [name]).or(0)
+
+// The statistics of the shared cache, summed over every process that uses it.
+pub fn shared_stats(s: Shared) -> Stats ! db, fail[DbErr]
+= Stats{hits: meta(s, "hits"), misses: meta(s, "misses"), puts: meta(s, "puts"), evictions: meta(s, "evictions"), expirations: meta(s, "expirations")}
+
+// Reads `key` and decodes it with `decode` (such as `x => json.decode[User](x).map(some).or(none)`);
+// a value that doesn't decode counts as missing.
+pub fn shared_get_as[T](s: Shared, key: Str, now_ms: Int, decode: Str -> Opt[T]) -> Opt[T] ! db, fail[DbErr]
+= shared_get(s, key, now_ms).map(decode).or(none)
+
+// Writes `value` as its JSON.
+pub fn shared_put_as[T: Json](s: Shared, key: Str, value: T, now_ms: Int, ttl_ms: Int where _ >= 0) -> Int ! db, fail[DbErr]
+  post r >= 0
+= shared_put(s, key, value.to_json, now_ms, ttl_ms)
+
+// Takes the lease of `key` for `owner` when no one holds a live one.
+fn acquire(s: Shared, key: Str, owner: Str, now_ms: Int, lease_ms: Int) -> Bool ! db, fail[DbErr]
+= db.tx(s.db, () => db.exec(s.db, "insert into {s.table}_leases (key, owner, expires_ms) values (?, ?, ?) on conflict (key) do update set owner = excluded.owner, expires_ms = excluded.expires_ms where {s.table}_leases.expires_ms <= ?", [key, owner, now_ms.saturating_add(lease_ms), now_ms]) == 1)
+
+fn release(s: Shared, key: Str, owner: Str) -> Unit ! db, fail[DbErr]
+= do
+  n = db.exec(s.db, "delete from {s.table}_leases where key = ? and owner = ?", [key, owner])
+  ()
+
+// Whether someone holds a live lease on `key`, computing it.
+pub fn shared_computing(s: Shared, key: Str, now_ms: Int) -> Bool ! db, fail[DbErr]
+= db.opt[Int](s.db, "select expires_ms from {s.table}_leases where key = ? and expires_ms > ?", [key, now_ms]).is_some
+
+// Computes `key` under its lease and stores it.
+fn compute_owned[e](s: Shared, key: Str, owner: Str, ttl_ms: Int, compute: () -> Str ! e) -> Str ! db, fail[DbErr], time, e
+= match shared_peek(s, key, now_ms())
+| some(v) => do
+  release(s, key, owner)
+  v
+| none => do
+  v = compute()
+  n = shared_put(s, key, v, now_ms(), ttl_ms)
+  release(s, key, owner)
+  v
+
+// The value of `key`, computed by `compute` (and stored for `ttl_ms`, 0 for no expiry) when it is
+// missing, with single-flight: of the callers that miss at the same time, in this process or any
+// other sharing the database, one takes a lease and computes while the others wait and get its
+// result. A waiter that waits longer than `f.wait_ms` computes the value itself. When a computer
+// crashes or `compute` raises, its lease runs out after `f.lease_ms` and the next caller takes over.
+pub fn fetch[e](s: Shared, key: Str, ttl_ms: Int where _ >= 0, f: Flight, compute: () -> Str ! e) -> Str ! db, fail[DbErr], time, rand, div, e
+= do
+  owner = crypto.token(12)
+  start = now_ms()
+  var result = shared_get(s, key, start)
+  var first = true
+  while result.is_none
+    now = now_ms()
+    if not first then result := shared_peek(s, key, now)
+    if result.is_some then bump_meta(s, "hits", 1) else if now - start >= f.wait_ms then result := some(compute_fallback(s, key, ttl_ms, compute)) else if acquire(s, key, owner, now, f.lease_ms) then result := some(compute_owned(s, key, owner, ttl_ms, compute)) else sleep_ms(f.poll_ms)
+    first := false
+  result.or("")
+
+fn compute_fallback[e](s: Shared, key: Str, ttl_ms: Int, compute: () -> Str ! e) -> Str ! db, fail[DbErr], time, e
+= do
+  v = compute()
+  n = shared_put(s, key, v, now_ms(), ttl_ms)
+  v
+
+// `fetch` for a JSON-encodable type: computes a `T`, stores its JSON, and decodes a cached value
+// with `decode`; a cached value that doesn't decode is computed again.
+pub fn fetch_as[T: Json, e](s: Shared, key: Str, ttl_ms: Int where _ >= 0, f: Flight, compute: () -> T ! e, decode: Str -> Opt[T]) -> T ! db, fail[DbErr], time, rand, div, e
+= do
+  text = fetch(s, key, ttl_ms, f, () => compute().to_json)
+  match decode(text)
+  | some(v) => v
+  | none => do
+    v = compute()
+    n = shared_put(s, key, v.to_json, now_ms(), ttl_ms)
+    v
+
+// ---------- HTTP: entity tags ----------
+
+// An entity tag (RFC 9110 8.8.3): its opaque text, without quotes, and whether it is weak.
+pub type Etag = {weak: Bool, tag: Str} derive Eq, Show
+
+// Whether `s` can be the text of an entity tag: etagc characters only (no spaces, quotes or
+// control characters).
+pub fn etag_text_ok(s: Str) -> Bool
+  ex etag_text_ok("v1.2-abc") and not etag_text_ok("a b") and not etag_text_ok("a\"b")
+= s.chars.all(c => c.byte_len > 1 or c > " " and c <= "~" and c != "\"")
+
+// A strong entity tag with text `tag`.
+pub fn strong_etag(tag: Str where etag_text_ok(_)) -> Etag
+  post not r.weak
+  ex strong_etag("v1") == Etag{weak: false, tag: "v1"}
+= Etag{weak: false, tag}
+
+// A weak entity tag with text `tag`.
+pub fn weak_etag(tag: Str where etag_text_ok(_)) -> Etag
+  post r.weak
+  ex weak_etag("v1") == Etag{weak: true, tag: "v1"}
+= Etag{weak: true, tag}
+
+// The field value of an entity tag: `"tag"` or `W/"tag"`.
+pub fn etag_str(e: Etag) -> Str
+  ex etag_str(weak_etag("x")) == "W/\"x\""
+= (if e.weak then "W/" else "") + "\"" + e.tag + "\""
+
+// Parses one entity tag, `"..."` or `W/"..."`.
+pub fn parse_etag(s: Str) -> Opt[Etag]
+  ex parse_etag("W/\"abc\"") == some(Etag{weak: true, tag: "abc"})
+  ex parse_etag("abc") == none
+= do
+  t = s.trim
+  (weak, rest) = if t.starts_with("W/") then (true, t.drop(2)) else (false, t)
+  inner = rest.drop(1).take(rest.len - 2)
+  if rest.len >= 2 and rest.starts_with("\"") and rest.ends_with("\"") and etag_text_ok(inner) then some(Etag{weak, tag: inner}) else none
+
+// A strong entity tag for a body: 128 bits of its SHA-256 in base64url, so the same body always
+// has the same tag. Use it when the bytes sent are the body itself.
+pub fn etag_for(body: Str) -> Etag
+  post not r.weak and r.tag.len == 22
+= Etag{weak: false, tag: crypto.sha256(body).slice(0, 16).base64url}
+
+// A weak entity tag for a body, for responses the server may compress or otherwise transform
+// (the `gzip` server field), whose bytes then differ from the body.
+pub fn weak_etag_for(body: Str) -> Etag
+  post r.weak
+= etag_for(body) with weak := true
+
+// Strong comparison (RFC 9110 8.8.3.2): both strong and the same text.
+pub fn strong_match(a: Etag, b: Etag) -> Bool
+  ex not strong_match(weak_etag("1"), weak_etag("1")) and strong_match(strong_etag("1"), strong_etag("1"))
+= not a.weak and not b.weak and a.tag == b.tag
+
+// Weak comparison: the same text, whatever the weakness.
+pub fn weak_match(a: Etag, b: Etag) -> Bool
+  ex weak_match(weak_etag("1"), strong_etag("1")) and not weak_match(strong_etag("1"), strong_etag("2"))
+= a.tag == b.tag
+
+// The value of an If-Match or If-None-Match field: `*` or a list of entity tags.
+pub type Condition = AnyTag | Tags{tags: List[Etag]} derive Eq, Show
+
+// Splits `s` at commas outside double quotes.
+fn split_list(s: Str) -> List[Str]
+= do
+  var out = []
+  var cur = str_buf()
+  var quoted = false
+  var escaped = false
+  for c in s.chars
+    if escaped then do
+        cur := cur.add(c)
+        escaped := false
+      else if quoted and c == "\\" then do
+          cur := cur.add(c)
+          escaped := true
+        else if c == "\"" then do
+            cur := cur.add(c)
+            quoted := not quoted
+          else if c == "," and not quoted then do
+              out := out.push(cur.str)
+              cur := str_buf()
+            else cur := cur.add(c)
+  out.push(cur.str).map(_.trim).filter(x => x != "")
+
+// Parses an If-Match or If-None-Match value; none when it is malformed (a `*` mixed with tags,
+// or an invalid tag) or empty.
+pub fn parse_condition(s: Str) -> Opt[Condition]
+  ex parse_condition("*") == some(AnyTag)
+  ex parse_condition("\"a\", W/\"b\"") == some(Tags{tags: [strong_etag("a"), weak_etag("b")]})
+= do
+  parts = split_list(s)
+  tags = parts.map(parse_etag)
+  if parts == ["*"] then some(AnyTag) else if parts.is_empty or not tags.all(_.is_some) then none else some(Tags{tags: tags.map(t => t.or(strong_etag("")))})
+
+// ---------- HTTP: dates ----------
+fn day_names() -> List[Str]
+= ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+fn long_day_names() -> List[Str]
+= ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+fn month_names() -> List[Str]
+= ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+// An HTTP date in the preferred IMF-fixdate form, `Sun, 06 Nov 1994 08:49:37 GMT` (RFC 9110 5.6.7).
+// Milliseconds are dropped.
+pub fn format_http_date(t: Time) -> Str
+  ex format_http_date(datetime(1994, 11, 6, 8, 49, 37).or(time_ms(0))) == "Sun, 06 Nov 1994 08:49:37 GMT"
+= t.format("%a, %d %b %Y %H:%M:%S GMT")
+
+fn num(s: Str, width: Int) -> Opt[Int]
+= if s.len == width and s.chars.all(c => "0123456789".contains(c)) then s.to_int else none
+
+fn clock(s: Str) -> Opt[(Int, Int, Int)]
+= match s.split(":")
+| [h, m, sec] => triple(num(h, 2), num(m, 2), num(sec, 2))
+| _ => none
+
+fn triple(a: Opt[Int], b: Opt[Int], c: Opt[Int]) -> Opt[(Int, Int, Int)]
+= match (a, b, c)
+| (some(x), some(y), some(z)) => some((x, y, z))
+| _ => none
+
+fn month(s: Str) -> Opt[Int]
+= month_names().index_of(s).map(i => i + 1)
+
+fn at(y: Opt[Int], mo: Opt[Int], d: Opt[Int], hms: Opt[(Int, Int, Int)]) -> Opt[Time]
+= match (y, mo, d, hms)
+| (some(yy), some(mm), some(dd), some((h, mi, s))) => datetime(yy, mm, dd, h, mi, s)
+| _ => none
+
+// A two-digit year: the century of `now`, or the previous one when that would be more than 50
+// years in the future (RFC 9110 5.6.7).
+fn full_year(yy: Int, now: Time) -> Int
+= do
+  y = now.year - now.year % 100 + yy
+  if y > now.year + 50 then y - 100 else y
+
+fn imf(parts: List[Str]) -> Opt[Time]
+= match parts
+| [wd, d, mo, y, hms, "GMT"] => if wd.len == 4 and wd.ends_with(",") and day_names().contains(wd.take(3)) then at(num(y, 4), month(mo), num(d, 2), clock(hms)) else none
+| _ => none
+
+fn rfc850(parts: List[Str], now: Time) -> Opt[Time]
+= match parts
+| [wd, dmy, hms, "GMT"] => if wd.ends_with(",") and long_day_names().contains(drop_last1(wd)) then dmy_date(dmy.split("-"), hms, now) else none
+| _ => none
+
+fn dmy_date(dmy: List[Str], hms: Str, now: Time) -> Opt[Time]
+= match dmy
+| [d, mo, y] => at(num(y, 2).map(v => full_year(v, now)), month(mo), num(d, 2), clock(hms))
+| _ => none
+
+fn drop_last1(s: Str) -> Str
+= s.take(s.len - 1)
+
+fn asctime(s: Str) -> Opt[Time]
+= if s.len != 24 then none else do
+  d = slice_str(s, 8, 10)
+  spaces = s.get(3) == some(" ") and s.get(7) == some(" ") and s.get(10) == some(" ") and s.get(19) == some(" ")
+  if day_names().contains(s.take(3)) and spaces then at(num(s.drop(20), 4), month(slice_str(s, 4, 7)), if d.starts_with(" ") then num(d.drop(1), 1) else num(d, 2), clock(slice_str(s, 11, 19))) else none
+
+fn slice_str(s: Str, a: Int, b: Int) -> Str
+= s.drop(a).take(b - a)
+
+// Parses an HTTP date in any of the three forms recipients must accept: IMF-fixdate, the obsolete
+// RFC 850 form (a two-digit year, read relative to `now`) and asctime. Names are case-sensitive and
+// the time zone must be GMT, as the RFC says; none for anything else.
+pub fn parse_http_date(s: Str, now: Time) -> Opt[Time]
+  ex parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT", time_ms(0)) == datetime(1994, 11, 6, 8, 49, 37)
+  ex parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT", datetime(2026, 1, 1, 0, 0, 0).or(time_ms(0))) == datetime(1994, 11, 6, 8, 49, 37)
+  ex parse_http_date("Sun Nov  6 08:49:37 1994", time_ms(0)) == datetime(1994, 11, 6, 8, 49, 37)
+= do
+  t = s.trim
+  parts = t.split(" ")
+  if t.contains(",") then (if parts.len == 6 then imf(parts) else rfc850(parts, now)) else asctime(t)
+
+// ---------- HTTP: conditional requests ----------
+
+// What the server knows about the current representation: its entity tag and its modification
+// time, either of which may be missing.
+pub type Validators = {etag: Opt[Etag], last_modified: Opt[Time]} derive Eq, Show
+
+// The result of evaluating a request's preconditions: go on, answer 304 Not Modified, or answer
+// 412 Precondition Failed.
+pub type Outcome = Proceed | NotModified | PreconditionFailed derive Eq, Show
+
+fn values_of(req: Request, name: Str) -> List[Str]
+= req.headers.filter(h => h.0.lower == name).map(h => h.1)
+
+fn single(req: Request, name: Str) -> Opt[Str]
+= match values_of(req, name)
+| [v] => some(v)
+| _ => none
+
+fn seconds(t: Time) -> Int
+= t.unix_ms - (t.unix_ms % 1000 + 1000) % 1000
+
+fn matches_any(c: Condition, v: Validators, exists: Bool, strong: Bool) -> Bool
+= match c
+| AnyTag => exists
+| Tags{tags} => match v.etag
+| some(e) => exists and tags.any(t => if strong then strong_match(t, e) else weak_match(t, e))
+| none => false
+
+fn condition(req: Request, name: Str) -> Opt[Opt[Condition]]
+= match values_of(req, name)
+| [] => none
+| vs => some(parse_condition(vs.join(", ")))
+
+fn date_field(req: Request, name: Str, now: Time) -> Opt[Time]
+= single(req, name).map(v => parse_http_date(v, now)).or(none)
+
+fn get_like(req: Request) -> Bool
+= req.method.upper == "GET" or req.method.upper == "HEAD"
+
+fn first_step(req: Request, v: Validators, exists: Bool, now: Time) -> Bool
+= match condition(req, "if-match")
+| some(c) => c.map(x => matches_any(x, v, exists, true)).or(false)
+| none => match (date_field(req, "if-unmodified-since", now), v.last_modified)
+| (some(d), some(lm)) => seconds(lm) <= seconds(d)
+| _ => true
+
+fn second_step(req: Request, v: Validators, exists: Bool, now: Time) -> Outcome
+= match condition(req, "if-none-match")
+| some(some(c)) => if not matches_any(c, v, exists, false) then Proceed else if get_like(req) then NotModified else PreconditionFailed
+| some(none) => Proceed
+| none => if get_like(req) and exists then modified_since(req, v, now) else Proceed
+
+fn modified_since(req: Request, v: Validators, now: Time) -> Outcome
+= match (date_field(req, "if-modified-since", now), v.last_modified)
+| (some(d), some(lm)) => if d <= now and seconds(lm) <= seconds(d) then NotModified else Proceed
+| _ => Proceed
+
+// Evaluates the preconditions of `req` against the current representation (`exists` is whether
+// there is one) in the order of RFC 9110 13.2.2: If-Match (strong comparison; a malformed value
+// fails), else If-Unmodified-Since; then If-None-Match (weak comparison: 304 for GET and HEAD,
+// 412 otherwise), else If-Modified-Since for GET and HEAD. Dates compare at whole seconds;
+// malformed or repeated dates, and If-Modified-Since dates after `now`, are ignored. Call it
+// before changing anything for PUT, PATCH and DELETE.
+pub fn evaluate(req: Request, v: Validators, exists: Bool, now: Time) -> Outcome
+  ex evaluate(Request{method: "GET", url: "/", headers: [("if-none-match", "\"a\"")], body: "", timeout_ms: 0, retries: 0, redirects: 0}, Validators{etag: some(strong_etag("a")), last_modified: none}, true, time_ms(0)) == NotModified
+= if not first_step(req, v, exists, now) then PreconditionFailed else second_step(req, v, exists, now)
+
+fn header_of(r: Response, name: Str) -> Opt[Str]
+= r.headers.find(h => h.0.lower == name).map(h => h.1)
+
+// The validators a response carries: its ETag and Last-Modified fields.
+pub fn validators_of(r: Response, now: Time) -> Validators
+  ex validators_of(Response{status: 200, headers: [("ETag", "\"v1\"")], body: ""}, time_ms(0)) == Validators{etag: some(strong_etag("v1")), last_modified: none}
+= Validators{etag: header_of(r, "etag").map(parse_etag).or(none), last_modified: header_of(r, "last-modified").map(s => parse_http_date(s, now)).or(none)}
+
+fn representation_field(name: Str) -> Bool
+= name.starts_with("content-") and name != "content-location" or name == "transfer-encoding"
+
+// The 304 Not Modified answer for a 200 response (RFC 9110 15.4.5): no body and no
+// representation metadata (Content-*), keeping ETag, Cache-Control, Expires, Vary, Date,
+// Content-Location and the other fields; Last-Modified only when there is no ETag.
+pub fn not_modified(r: Response) -> Response
+  post r.status == 304 and r.body == ""
+= do
+  has_etag = header_of(r, "etag").is_some
+  Response{status: 304, headers: r.headers.filter(h => not representation_field(h.0.lower) and not (has_etag and h.0.lower == "last-modified")), body: ""}
+
+// The 412 Precondition Failed answer, with the current entity tag when there is one.
+pub fn precondition_failed(v: Validators) -> Response
+  post r.status == 412
+= Response{status: 412, headers: [("content-type", "text/plain; charset=utf-8"), ("cache-control", "no-store")] + v.etag.map(e => [("ETag", etag_str(e))]).or([]), body: "Precondition Failed\n"}
+
+// Applies conditional GET to a response already made: for a GET or HEAD answered 200, the
+// request's preconditions are evaluated against the response's own ETag and Last-Modified, giving
+// 304 or 412 where they say so. Other requests and statuses pass unchanged.
+pub fn conditional(req: Request, r: Response, now: Time) -> Response
+  ex conditional(Request{method: "POST", url: "/", headers: [("if-none-match", "*")], body: "", timeout_ms: 0, retries: 0, redirects: 0}, Response{status: 200, headers: [], body: "x"}, time_ms(0)).status == 200
+= if not get_like(req) or r.status != 200 then r else do
+  v = validators_of(r, now)
+  match evaluate(req, v, true, now)
+  | Proceed => r
+  | NotModified => not_modified(r)
+  | PreconditionFailed => precondition_failed(v)
+
+// Sets field `name` (case-insensitively replacing any) on a response.
+pub fn set_header(r: Response, name: Str, value: Str) -> Response
+  ex set_header(Response{status: 200, headers: [("ETAG", "1")], body: ""}, "ETag", "2").headers == [("ETag", "2")]
+= r with headers := r.headers.filter(h => h.0.lower != name.lower) + [(name, value)]
+
+// Adds an ETag computed from the body (weak with `weak`) to a 200 response that has none.
+pub fn with_etag(r: Response, weak: Bool) -> Response
+  ex with_etag(Response{status: 200, headers: [], body: "x"}, true).headers.len == 1
+= if r.status != 200 or header_of(r, "etag").is_some then r else set_header(r, "ETag", etag_str(if weak then weak_etag_for(r.body) else etag_for(r.body)))
+
+// Wraps a handler with conditional GET: 200 answers to GET and HEAD get an ETag from their body
+// (weak with `weak`, which suits the server's `gzip` field) unless they have one, and the
+// request's If-None-Match, If-Modified-Since, If-Match and If-Unmodified-Since are applied to them.
+// The handler still runs (this saves bandwidth, not work). Build it inside the handler lambda.
+pub fn conditional_get[e](weak: Bool, next: Request -> Response ! e) -> Request -> Response ! e, time
+= req => do
+  r = next(req)
+  conditional(req, if get_like(req) then with_etag(r, weak) else r, now())
+
+// ---------- HTTP: Cache-Control, Vary and Age ----------
+
+// The directives of a Cache-Control field (RFC 9111 5.2), for responses and requests. Durations
+// are in seconds; `max_stale` without a value is 2147483648. Unknown directives are kept in
+// `extensions` with their values ("" for none).
+pub type CacheControl = {max_age: Opt[Int], s_maxage: Opt[Int], no_cache: Bool, no_cache_fields: List[Str], no_store: Bool, private: Bool, private_fields: List[Str], public: Bool, must_revalidate: Bool, proxy_revalidate: Bool, must_understand: Bool, no_transform: Bool, immutable: Bool, stale_while_revalidate: Opt[Int], stale_if_error: Opt[Int], max_stale: Opt[Int], min_fresh: Opt[Int], only_if_cached: Bool, extensions: List[(Str, Str)]} derive Eq, Show
+
+// No directives.
+pub fn cache_control() -> CacheControl
+  post r.extensions.is_empty
+= CacheControl{max_age: none, s_maxage: none, no_cache: false, no_cache_fields: [], no_store: false, private: false, private_fields: [], public: false, must_revalidate: false, proxy_revalidate: false, must_understand: false, no_transform: false, immutable: false, stale_while_revalidate: none, stale_if_error: none, max_stale: none, min_fresh: none, only_if_cached: false, extensions: []}
+
+// `no-store`: for anything personal or secret.
+pub fn no_store() -> CacheControl
+  ex render_cache_control(no_store()) == "no-store"
+= cache_control() with no_store := true
+
+// `no-cache`: caches may store it but must revalidate every time (pair it with an ETag).
+pub fn revalidate() -> CacheControl
+  ex render_cache_control(revalidate()) == "no-cache"
+= cache_control() with no_cache := true
+
+// `public, max-age=secs`.
+pub fn public_for(secs: Int where _ >= 0) -> CacheControl
+  ex render_cache_control(public_for(60)) == "public, max-age=60"
+= cache_control() with public := true, max_age := some(secs)
+
+// `private, max-age=secs`: only the user's own browser may keep it.
+pub fn private_for(secs: Int where _ >= 0) -> CacheControl
+  ex render_cache_control(private_for(60)) == "private, max-age=60"
+= cache_control() with private := true, max_age := some(secs)
+
+// `public, max-age=secs, immutable`: for assets whose URL changes with their content.
+pub fn immutable_for(secs: Int where _ >= 0) -> CacheControl
+  ex render_cache_control(immutable_for(31536000)) == "public, max-age=31536000, immutable"
+= public_for(secs) with immutable := true
+
+fn quoted_list(xs: List[Str]) -> Str
+= "\"" + xs.join(", ") + "\""
+
+fn opt_dir(name: Str, v: Opt[Int]) -> List[Str]
+= v.map(n => ["{name}={n}"]).or([])
+
+fn flag(name: Str, b: Bool) -> List[Str]
+= if b then [name] else []
+
+fn ext(e: (Str, Str)) -> Str
+= if e.1 == "" then e.0 else if e.1.chars.all(c => c.is_alpha or "0123456789-._~".contains(c)) then "{e.0}={e.1}" else "{e.0}=\"" + e.1.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+// The field value of a Cache-Control, directives in a fixed order.
+pub fn render_cache_control(cc: CacheControl) -> Str
+  ex render_cache_control(cache_control() with no_cache := true, no_cache_fields := ["Set-Cookie"]) == "no-cache=\"Set-Cookie\""
+= do
+  priv = if cc.private and not cc.private_fields.is_empty then ["private=" + quoted_list(cc.private_fields)] else flag("private", cc.private)
+  nc = if cc.no_cache and not cc.no_cache_fields.is_empty then ["no-cache=" + quoted_list(cc.no_cache_fields)] else flag("no-cache", cc.no_cache)
+  ms = match cc.max_stale
+  | some(n) => if n >= 2147483648 then ["max-stale"] else ["max-stale={n}"]
+  | none => []
+  (flag("public", cc.public) + priv + nc + flag("no-store", cc.no_store) + opt_dir("max-age", cc.max_age) + opt_dir("s-maxage", cc.s_maxage) + flag("must-revalidate", cc.must_revalidate) + flag("proxy-revalidate", cc.proxy_revalidate) + flag("must-understand", cc.must_understand) + flag("no-transform", cc.no_transform) + flag("immutable", cc.immutable) + opt_dir("stale-while-revalidate", cc.stale_while_revalidate) + opt_dir("stale-if-error", cc.stale_if_error) + ms + opt_dir("min-fresh", cc.min_fresh) + flag("only-if-cached", cc.only_if_cached) + cc.extensions.map(ext)).join(", ")
+
+// The Cache-Control field for `cc`.
+pub fn cache_control_header(cc: CacheControl) -> (Str, Str)
+  ex cache_control_header(no_store()) == ("Cache-Control", "no-store")
+= ("Cache-Control", render_cache_control(cc))
+
+// Sets the Cache-Control field of a response, replacing any.
+pub fn with_cache_control(r: Response, cc: CacheControl) -> Response
+  ex with_cache_control(Response{status: 200, headers: [("cache-control", "x")], body: ""}, no_store()).headers == [("Cache-Control", "no-store")]
+= set_header(r, "Cache-Control", render_cache_control(cc))
+
+// A delta-seconds value: digits only, clamped to 2^31 as RFC 9111 1.2.2 says.
+pub fn parse_delta(s: Str) -> Opt[Int]
+  ex parse_delta("99999999999999999999") == some(2147483648)
+  ex parse_delta("-1") == none
+= if s.len >= 1 and s.chars.all(c => "0123456789".contains(c)) then some(if s.len > 10 then 2147483648 else min(s.to_int.or(0), 2147483648)) else none
+
+fn unq(v: Str) -> Str
+= do
+  t = v.trim
+  if t.len >= 2 and t.starts_with("\"") and t.ends_with("\"") then t.drop(1).take(t.len - 2).replace("\\\"", "\"").replace("\\\\", "\\") else t
+
+fn fields(v: Str) -> List[Str]
+= unq(v).split(",").map(_.trim).filter(x => x != "")
+
+fn first_delta(cur: Opt[Int], v: Str) -> Opt[Int]
+= if cur.is_some then cur else parse_delta(unq(v))
+
+fn directive(cc: CacheControl, d: Str) -> CacheControl
+= do
+  (name, v) = match d.split_once("=")
+  | some((a, b)) => (a.trim.lower, b.trim)
+  | none => (d.trim.lower, "")
+  match name
+  | "max-age" => cc with max_age := first_delta(cc.max_age, v)
+  | "s-maxage" => cc with s_maxage := first_delta(cc.s_maxage, v)
+  | "no-cache" => cc with no_cache := true, no_cache_fields := cc.no_cache_fields + fields(v)
+  | "no-store" => cc with no_store := true
+  | "private" => cc with private := true, private_fields := cc.private_fields + fields(v)
+  | "public" => cc with public := true
+  | "must-revalidate" => cc with must_revalidate := true
+  | "proxy-revalidate" => cc with proxy_revalidate := true
+  | "must-understand" => cc with must_understand := true
+  | "no-transform" => cc with no_transform := true
+  | "immutable" => cc with immutable := true
+  | "stale-while-revalidate" => cc with stale_while_revalidate := first_delta(cc.stale_while_revalidate, v)
+  | "stale-if-error" => cc with stale_if_error := first_delta(cc.stale_if_error, v)
+  | "max-stale" => cc with max_stale := if v == "" then some(2147483648) else first_delta(cc.max_stale, v)
+  | "min-fresh" => cc with min_fresh := first_delta(cc.min_fresh, v)
+  | "only-if-cached" => cc with only_if_cached := true
+  | "" => cc
+  | _ => cc with extensions := cc.extensions.push((name, unq(v)))
+
+// Parses a Cache-Control value: directive names are case-insensitive, values tokens or quoted
+// strings; of a repeated directive the first counts, and a malformed duration is ignored.
+pub fn parse_cache_control(s: Str) -> CacheControl
+  ex parse_cache_control("Public, max-age=60, max-age=5").max_age == some(60)
+= split_list(s).fold(cache_control(), directive)
+
+// The Cache-Control of a response, every field line together.
+pub fn cache_control_of(r: Response) -> CacheControl
+  ex cache_control_of(Response{status: 200, headers: [("cache-control", "no-store"), ("Cache-Control", "max-age=1")], body: ""}).max_age == some(1)
+= parse_cache_control(r.headers.filter(h => h.0.lower == "cache-control").map(h => h.1).join(", "))
+
+// The field names a response varies on (the Vary field lines together).
+pub fn vary_of(r: Response) -> List[Str]
+  ex vary_of(Response{status: 200, headers: [("Vary", "Accept-Encoding, Origin")], body: ""}) == ["Accept-Encoding", "Origin"]
+= r.headers.filter(h => h.0.lower == "vary").flat_map(h => h.1.split(",")).map(_.trim).filter(x => x != "")
+
+// Adds field names to the response's Vary, once each (case-insensitively), in one field line;
+// `*` absorbs everything.
+pub fn add_vary(r: Response, names: List[Str]) -> Response
+  ex add_vary(Response{status: 200, headers: [("vary", "origin")], body: ""}, ["Origin", "Accept"]).headers == [("Vary", "origin, Accept")]
+= do
+  fn add_name(acc: List[Str], n: Str) -> List[Str]
+  = if acc.any(a => a.lower == n.lower) then acc else acc.push(n)
+  all = (vary_of(r) + names.map(_.trim).filter(x => x != "")).fold([], add_name)
+  value = if all.contains("*") then "*" else all.join(", ")
+  if value == "" then r else set_header(r, "Vary", value)
+
+// The freshness lifetime of a response in seconds (RFC 9111 4.2.1): s-maxage for a shared cache,
+// else max-age, else Expires minus Date (an invalid Expires means already stale); none when the
+// response says nothing (a heuristic lifetime is the cache's choice).
+pub fn freshness_lifetime(cc: CacheControl, shared: Bool, date: Opt[Time], expires: Opt[Str]) -> Opt[Int]
+  ex freshness_lifetime(parse_cache_control("max-age=60, s-maxage=600"), true, none, none) == some(600)
+= if shared and cc.s_maxage.is_some then cc.s_maxage else if cc.max_age.is_some then cc.max_age else match expires
+| some(e) => some(expires_lifetime(e, date))
+| none => none
+
+fn expires_lifetime(e: Str, date: Opt[Time]) -> Int
+= match (parse_http_date(e, date.or(time_ms(0))), date)
+| (some(x), some(d)) => max(0, (x.unix_ms - d.unix_ms) / 1000)
+| _ => 0
+
+// The current age of a stored response in seconds (RFC 9111 4.2.3), from its Age value, its Date,
+// when the request was sent, when the response arrived, and now.
+pub fn current_age(age_value: Int where _ >= 0, date: Opt[Time], request_time: Time, response_time: Time, now: Time) -> Int
+  post r >= 0
+  ex current_age(10, none, time_ms(0), time_ms(2000), time_ms(5000)) == 15
+= do
+  apparent = date.map(d => max(0, (response_time.unix_ms - d.unix_ms) / 1000)).or(0)
+  corrected = age_value + max(0, (response_time.unix_ms - request_time.unix_ms) / 1000)
+  max(apparent, corrected) + max(0, (now.unix_ms - response_time.unix_ms) / 1000)
+
+// Whether a response of `lifetime` seconds and `age` seconds is still fresh.
+pub fn is_fresh(lifetime: Int, age: Int) -> Bool
+  ex is_fresh(60, 59) and not is_fresh(60, 60)
+= lifetime > age
+
+// The Age field for `secs` seconds.
+pub fn age_header(secs: Int where _ >= 0) -> (Str, Str)
+  ex age_header(5) == ("Age", "5")
+= ("Age", "{secs}")
+
+// ---------- tests ----------
+fn rq(method: Str, headers: List[(Str, Str)]) -> Request
+= Request{method, url: "/", headers, body: "", timeout_ms: 0, retries: 0, redirects: 0}
+
+fn t0() -> Time
+= datetime(2026, 10, 16, 12, 0, 0).or(time_ms(0))
+
+fn at_s(n: Int) -> Time
+= t0().add(secs(n))
+
+fn abc() -> Cache[Str, Int]
+= put(put(put(lru(3), "a", 1, 0), "b", 2, 0), "c", 3, 0)
+
+test lru_evicts_least_recent = do
+  c = put(abc(), "d", 4, 0)
+  keys(c) == ["d", "c", "b"] and stats(c).evictions == 1 and lru_key(c) == some("b")
+
+test get_refreshes_recency = do
+  (v, c) = get(abc(), "a", 0)
+  c2 = put(c, "d", 4, 0)
+  v == some(1) and keys(c2) == ["d", "a", "c"]
+
+test peek_keeps_recency = do
+  c = abc()
+  p = peek(c, "a", 0)
+  p == some(1) and keys(put(c, "d", 4, 0)) == ["d", "c", "b"] and stats(c).hits == 0
+
+test capacity_one = keys(put(put(lru(1), "a", 1, 0), "b", 2, 0)) == ["b"]
+
+test statistics = do
+  (_, c1) = get(abc(), "a", 0)
+  (_, c2) = get(c1, "zz", 0)
+  (_, c3) = get(c2, "b", 0)
+  s = stats(c3)
+  s == Stats{hits: 2, misses: 1, puts: 3, evictions: 0, expirations: 0} and hit_rate(s) > 0.66 and hit_rate(s) < 0.67 and hit_rate(stats(lru(1))) == 0.0
+
+test ttl_boundary = do
+  c = put_ttl(lru(3), "a", 1, 100, 50)
+  (v, c2) = get(c, "a", 150)
+  peek(c, "a", 149) == some(1) and v == none and size(c2) == 0 and stats(c2).expirations == 1 and stats(c2).misses == 1 and ttl_left(c, "a", 120) == some(30) and ttl_left(c, "a", 150) == none
+
+test default_ttl_and_none = do
+  c = ttl_lru(3, 10)
+  c1 = put(c, "a", 1, 0)
+  (c2, _) = insert(c1, "b", 2, 0, none, 1)
+  peek(c2, "a", 10) == none and peek(c2, "b", 1000000) == some(2) and ttl_left(c2, "b", 0) == none
+
+test refresh_on_get = do
+  c = new(config(3) with ttl_ms := 10, refresh_on_get := true)
+  c1 = put(c, "a", 1, 0)
+  (_, c2) = get(c1, "a", 8)
+  (v, _) = get(c2, "a", 15)
+  v == some(1) and peek(c1, "a", 15) == none
+
+test touching = do
+  c = put_ttl(put(lru(2), "a", 1, 0), "b", 2, 0, 10)
+  t = touch(c, "b", 8)
+  ttl_left(t, "b", 8) == some(10) and keys(touch(c, "a", 0)) == ["a", "b"] and touch(c, "zz", 0) == c and stats(t).hits == 0
+
+test cost_bound = do
+  c = new(config(10) with max_cost := 10)
+  (c1, _) = insert(c, "a", 1, 0, none, 4)
+  (c2, _) = insert(c1, "b", 2, 0, none, 4)
+  (c3, gone) = insert(c2, "c", 3, 0, none, 4)
+  (c4, rejected) = insert(c3, "b", 9, 0, none, 11)
+  gone == [("a", 1)] and total_cost(c3) == 8 and rejected == [] and peek(c4, "b", 0) == none and total_cost(c4) == 4 and keys(c4) == ["c"]
+
+test expired_go_before_lru = do
+  c = put(put_ttl(lru(2), "a", 1, 0, 5), "b", 2, 0)
+  (c2, gone) = insert(c, "c", 3, 10, none, 1)
+  gone == [("a", 1)] and keys(c2) == ["c", "b"] and stats(c2).expirations == 1 and stats(c2).evictions == 0
+
+test overwrite_does_not_evict = do
+  c = put(abc(), "a", 10, 0)
+  size(c) == 3 and stats(c).evictions == 0 and peek(c, "a", 0) == some(10) and mru_key(c) == some("a")
+
+test remove_take_clear = do
+  c = abc()
+  (v, c2) = take(c, "b", 0)
+  cl = clear(c)
+  v == some(2) and keys(c2) == ["c", "a"] and size(remove(c, "zz")) == 3 and size(cl) == 0 and stats(cl) == stats(c) and total_cost(cl) == 0 and lru_key(cl) == none
+
+test resizing = do
+  (c, gone) = resize(abc(), 1, 0)
+  keys(c) == ["c"] and gone == [("a", 1), ("b", 2)] and resize(abc(), 5, 0).1 == []
+
+test items_skip_expired = do
+  c = put_ttl(put(lru(3), "a", 1, 0), "b", 2, 0, 5)
+  items(c, 0) == [("b", 2), ("a", 1)] and items(c, 5) == [("a", 1)] and has(c, "b", 4) and not has(c, "b", 5)
+
+test compute_once = do
+  (v1, c1) = get_or_compute(lru(2), "abc", 0, k => k.len)
+  (v2, c2) = get_or_compute(c1, "abc", 0, k => 99)
+  v1 == 3 and v2 == 3 and stats(c2).hits == 1 and stats(c2).misses == 1
+
+test purge_all_expired = do
+  c = put_ttl(put_ttl(put(lru(5), "a", 1, 0), "b", 2, 0, 5), "c", 3, 0, 7)
+  (p, gone) = purge_expired(c, 7)
+  gone == [("b", 2), ("c", 3)] and keys(p) == ["a"] and purge_expired(c, 0).1 == []
+
+// The LRU model: keys most recently used first, at most `cap` of them.
+fn model_step(m: List[Str], op: (Bool, Str), cap: Int) -> List[Str]
+= if op.0 then ([op.1] + m.filter(k => k != op.1)).take(cap) else if m.contains(op.1) then [op.1] + m.filter(k => k != op.1) else m
+
+fn cache_step(c: Cache[Str, Int], op: (Bool, Str)) -> Cache[Str, Int]
+= if op.0 then put(c, op.1, 1, 0) else get(c, op.1, 0).1
+
+fn random_ops(seed: Int, n: Int) -> List[(Bool, Str)]
+= do
+  var sd = seed
+  var out = []
+  for i in 0..n
+    (k, s1) = rand_int(sd, 0, 6)
+    (w, s2) = rand_bool(s1, 0.5)
+    sd := s2
+    out := out.push((w, "k{k}"))
+  out
+
+test matches_lru_model = do
+  ops = random_ops(3, 500)
+  var c = lru(3)
+  var m = []
+  var ok = true
+  for op in ops
+    c := cache_step(c, op)
+    m := model_step(m, op, 3)
+    ok := ok and keys(c) == m
+  ok
+
+fn mem_shared(capacity: Int) -> Shared ! db, fail[DbErr]
+= shared(db.open(":memory:"), "cache", capacity)
+
+test shared_basics = catch do
+  s = mem_shared(10)
+  n = shared_put(s, "a", "1", 0, 0)
+  g = shared_get(s, "a", 0)
+  m = shared_get(s, "zz", 0)
+  p = shared_peek(s, "a", 0)
+  d = shared_delete(s, "a")
+  st = shared_stats(s)
+  n == 0 and g == some("1") and m == none and p == some("1") and d and not shared_delete(s, "a") and shared_count(s) == 0 and st == Stats{hits: 1, misses: 1, puts: 1, evictions: 0, expirations: 0}
+| _ => false
+
+test shared_ttl = catch do
+  s = mem_shared(10)
+  a = shared_put(s, "a", "1", 0, 100)
+  b = shared_put(s, "b", "2", 0, 50)
+  c = shared_put(s, "c", "3", 0, 0)
+  live = shared_get(s, "a", 99)
+  dead = shared_get(s, "a", 100)
+  purged = shared_purge(s, 1000000)
+  dead == none and live == some("1") and purged == 1 and shared_count(s) == 1 and shared_stats(s).expirations == 2 and shared_peek(s, "c", 999999999) == some("3")
+| _ => false
+
+test shared_lru_eviction = catch do
+  s = mem_shared(2)
+  a = shared_put(s, "a", "1", 0, 0)
+  b = shared_put(s, "b", "2", 0, 0)
+  g = shared_get(s, "a", 0)
+  gone = shared_put(s, "c", "3", 0, 0)
+  gone == 1 and shared_peek(s, "b", 0) == none and shared_peek(s, "a", 0) == some("1") and shared_stats(s).evictions == 1
+| _ => false
+
+test shared_expired_first = catch do
+  s = mem_shared(2)
+  a = shared_put(s, "a", "1", 0, 0)
+  b = shared_put(s, "b", "2", 0, 5)
+  gone = shared_put(s, "c", "3", 10, 0)
+  gone == 1 and shared_peek(s, "a", 10) == some("1") and shared_stats(s).expirations == 1 and shared_stats(s).evictions == 0
+| _ => false
+
+test shared_clear_and_reopen = catch do
+  c = db.open(":memory:")
+  s = shared(c, "cache", 5)
+  a = shared_put(s, "a", "1", 0, 0)
+  again = shared(c, "cache", 5)
+  kept = shared_peek(again, "a", 0)
+  n = shared_clear(again)
+  kept == some("1") and n == 1 and shared_count(s) == 0 and shared_stats(again).puts == 1
+| _ => false
+
+type User = {id: Int, name: Str} derive Eq, Show, Json
+
+fn decode_user(s: Str) -> Opt[User]
+= match json.decode[User](s)
+| ok(u) => some(u)
+| err(_) => none
+
+test shared_typed = catch do
+  s = mem_shared(5)
+  n = shared_put_as(s, "u", User{id: 1, name: "Ada"}, 0, 0)
+  m = shared_put(s, "bad", "nope", 0, 0)
+  shared_get_as(s, "u", 0, decode_user) == some(User{id: 1, name: "Ada"}) and shared_get_as(s, "bad", 0, decode_user) == none and shared_get_as(s, "zz", 0, decode_user) == none
+| _ => false
+
+fn counted(n: Atomic[Int], v: Str) -> Str ! conc
+= do
+  n.add(1)
+  v
+
+test fetch_computes_once = catch do
+  s = mem_shared(5)
+  n = atomic(0)
+  a = fetch(s, "k", 0, flight(), () => counted(n, "v"))
+  b = fetch(s, "k", 0, flight(), () => counted(n, "other"))
+  a == "v" and b == "v" and n.load == 1 and not shared_computing(s, "k", now_ms())
+| _ => false
+
+test fetch_takes_over_stale_lease = catch do
+  s = mem_shared(5)
+  x = db.exec(s.db, "insert into cache_leases (key, owner, expires_ms) values ('k', 'crashed', 0)")
+  v = fetch(s, "k", 0, flight(), () => "fresh")
+  v == "fresh" and shared_peek(s, "k", 0) == some("fresh")
+| _ => false
+
+test fetch_gives_up_waiting = catch do
+  s = mem_shared(5)
+  x = db.exec(s.db, "insert into cache_leases (key, owner, expires_ms) values ('k', 'busy', ?)", [now_ms() + 3600000])
+  busy = shared_computing(s, "k", now_ms())
+  v = fetch(s, "k", 0, Flight{lease_ms: 1000, wait_ms: 50, poll_ms: 5}, () => "mine")
+  busy and v == "mine"
+| _ => false
+
+test fetch_as_recomputes_bad_values = catch do
+  s = mem_shared(5)
+  x = shared_put(s, "u", "not json", 0, 0)
+  u = fetch_as(s, "u", 0, flight(), () => User{id: 2, name: "Bo"}, decode_user)
+  u == User{id: 2, name: "Bo"} and shared_get_as(s, "u", 0, decode_user) == some(u)
+| _ => false
+
+fn slow(n: Atomic[Int]) -> Str ! conc, time
+= do
+  n.add(1)
+  sleep_ms(300)
+  "slow"
+
+fn racer(s: Shared, n: Atomic[Int], got: Atomic[Int]) -> Unit ! conc, time, rand, div, db, fail[DbErr]
+= do
+  v = fetch(s, "hot", 0, Flight{lease_ms: 120000, wait_ms: 120000, poll_ms: 5}, () => slow(n))
+  if v == "slow" then got.add(1)
+
+test single_flight_under_contention = catch do
+  s = mem_shared(5)
+  n = atomic(0)
+  got = atomic(0)
+  for i in par(0..8)
+    racer(s, n, got)
+  n.load == 1 and got.load == 8
+| _ => false
+
+fn tmp_db(name: Str) -> Str ! env, fs
+= do
+  dir = env_var("TMPDIR").or(env_var("TEMP").or("/tmp")).replace("\\", "/")
+  path = dir + "/cache-test-" + name + ".db"
+  for suffix in ["", "-wal", "-shm"]
+    r = remove_file(path + suffix)
+  path
+
+test shared_across_handles = catch do
+  path = tmp_db("handles")
+  a = shared(db.open(path), "cache", 5)
+  x = shared_put(a, "k", "v", 0, 0)
+  db.close(a.db)
+  b = shared(db.open(path), "cache", 5)
+  v = shared_get(b, "k", 0)
+  db.close(b.db)
+  v == some("v")
+| _ => false
+
+test table_names = valid_table_name("_c1") and not valid_table_name("") and not valid_table_name("a".repeat(51)) and not valid_table_name("a-b")
+
+test etag_parsing = parse_etag(" \"x\" ") == some(strong_etag("x")) and parse_etag("\"\"") == some(strong_etag("")) and [parse_etag("\"a b\""), parse_etag("\"a"), parse_etag("w/\"x\""), parse_etag("W/x"), parse_etag(""), parse_etag("\"a\"b\"")].all(_.is_none) and etag_str(strong_etag("x")) == "\"x\""
+
+test etags_for_bodies = etag_for("hello") == etag_for("hello") and etag_for("hello") != etag_for("hellp") and weak_etag_for("x").tag == etag_for("x").tag and etag_text_ok(etag_for("anything").tag)
+
+test conditions = parse_condition("*, \"a\"") == none and parse_condition("") == none and parse_condition(" , \"a\" ,") == some(Tags{tags: [strong_etag("a")]}) and parse_condition("\"a,b\"") == some(Tags{tags: [strong_etag("a,b")]}) and parse_condition("\"a\", junk") == none
+
+test http_dates = do
+  times = [t0(), datetime(2000, 2, 29, 23, 59, 59).or(t0()), datetime(1970, 1, 1, 0, 0, 0).or(t0())]
+  round = times.all(t => parse_http_date(format_http_date(t), t0()) == some(t))
+  bad = ["Sun, 6 Nov 1994 08:49:37 GMT", "sun, 06 Nov 1994 08:49:37 GMT", "Sun, 06 Nov 1994 08:49:37 UTC", "Sun, 30 Feb 1994 08:49:37 GMT", "Sun, 06 nov 1994 08:49:37 GMT", "Sun, 06 Nov 1994 8:49:37 GMT", "", "Sun Nov 6 08:49:37 1994", "Funday, 06-Nov-94 08:49:37 GMT"].all(s => parse_http_date(s, t0()).is_none)
+  two = parse_http_date("Monday, 06-Nov-30 08:49:37 GMT", t0()).map(t => t.year) == some(2030) and parse_http_date("Monday, 06-Nov-80 08:49:37 GMT", t0()).map(t => t.year) == some(1980)
+  asc = parse_http_date("Fri Oct 16 12:00:00 2026", t0()) == some(t0())
+  ms = format_http_date(t0().add(millis(999))) == format_http_date(t0())
+  round and bad and two and asc and ms
+
+fn val(tag: Str, lm: Opt[Time]) -> Validators
+= Validators{etag: some(strong_etag(tag)), last_modified: lm}
+
+test if_none_match = do
+  v = val("a", none)
+  g = evaluate(rq("GET", [("If-None-Match", "\"x\", \"a\"")]), v, true, t0())
+  h = evaluate(rq("HEAD", [("if-none-match", "W/\"a\"")]), v, true, t0())
+  miss = evaluate(rq("GET", [("if-none-match", "\"b\"")]), v, true, t0())
+  put_ = evaluate(rq("PUT", [("if-none-match", "\"a\"")]), v, true, t0())
+  star = evaluate(rq("GET", [("if-none-match", "*")]), v, true, t0())
+  create = evaluate(rq("PUT", [("if-none-match", "*")]), v, false, t0())
+  lines = evaluate(rq("GET", [("if-none-match", "\"x\""), ("if-none-match", "\"a\"")]), v, true, t0())
+  g == NotModified and h == NotModified and miss == Proceed and put_ == PreconditionFailed and star == NotModified and create == Proceed and lines == NotModified
+
+test if_match = do
+  v = val("a", none)
+  ok_ = evaluate(rq("PUT", [("if-match", "\"a\"")]), v, true, t0())
+  weak = evaluate(rq("PUT", [("if-match", "W/\"a\"")]), v, true, t0())
+  other = evaluate(rq("PUT", [("if-match", "\"b\"")]), v, true, t0())
+  star_missing = evaluate(rq("PUT", [("if-match", "*")]), v, false, t0())
+  junk = evaluate(rq("PUT", [("if-match", "junk")]), v, true, t0())
+  no_tag = evaluate(rq("PUT", [("if-match", "\"a\"")]), Validators{etag: none, last_modified: none}, true, t0())
+  ok_ == Proceed and weak == PreconditionFailed and other == PreconditionFailed and star_missing == PreconditionFailed and junk == PreconditionFailed and no_tag == PreconditionFailed
+
+test unmodified_since = do
+  v = val("a", some(at_s(10)))
+  late = evaluate(rq("DELETE", [("if-unmodified-since", format_http_date(at_s(5)))]), v, true, at_s(100))
+  same = evaluate(rq("DELETE", [("if-unmodified-since", format_http_date(at_s(10)))]), v, true, at_s(100))
+  bad = evaluate(rq("DELETE", [("if-unmodified-since", "yesterday")]), v, true, at_s(100))
+  first = evaluate(rq("DELETE", [("if-match", "\"a\""), ("if-unmodified-since", format_http_date(at_s(5)))]), v, true, at_s(100))
+  late == PreconditionFailed and same == Proceed and bad == Proceed and first == Proceed
+
+test if_modified_since = do
+  v = val("a", some(at_s(10).add(millis(500))))
+  same = evaluate(rq("GET", [("if-modified-since", format_http_date(at_s(10)))]), v, true, at_s(100))
+  newer = evaluate(rq("GET", [("if-modified-since", format_http_date(at_s(9)))]), v, true, at_s(100))
+  future = evaluate(rq("GET", [("if-modified-since", format_http_date(at_s(500)))]), v, true, at_s(100))
+  post_ = evaluate(rq("POST", [("if-modified-since", format_http_date(at_s(10)))]), v, true, at_s(100))
+  inm_wins = evaluate(rq("GET", [("if-none-match", "\"b\""), ("if-modified-since", format_http_date(at_s(10)))]), v, true, at_s(100))
+  two = evaluate(rq("GET", [("if-modified-since", format_http_date(at_s(10))), ("if-modified-since", format_http_date(at_s(10)))]), v, true, at_s(100))
+  missing = evaluate(rq("GET", [("if-modified-since", format_http_date(at_s(10)))]), v, false, at_s(100))
+  same == NotModified and newer == Proceed and future == Proceed and post_ == Proceed and inm_wins == Proceed and two == Proceed and missing == Proceed
+
+fn page() -> Response
+= Response{status: 200, headers: [("content-type", "text/html"), ("ETag", "\"v1\""), ("Last-Modified", "Fri, 16 Oct 2026 12:00:00 GMT"), ("Cache-Control", "no-cache"), ("Vary", "Accept-Encoding"), ("set-cookie", "a=b"), ("content-length", "5")], body: "hello"}
+
+test not_modified_fields = do
+  n = not_modified(page())
+  plain = not_modified(Response{status: 200, headers: [("Last-Modified", "x"), ("content-type", "a")], body: "b"})
+  n.status == 304 and n.body == "" and n.header("etag") == some("\"v1\"") and n.header("cache-control") == some("no-cache") and n.header("vary").is_some and n.header("set-cookie").is_some and n.header("content-type") == none and n.header("content-length") == none and n.header("last-modified") == none and plain.header("last-modified") == some("x") and plain.header("content-type") == none
+
+test conditional_responses = do
+  r304 = conditional(rq("GET", [("if-none-match", "\"v1\"")]), page(), t0())
+  r412 = conditional(rq("GET", [("if-match", "\"v2\"")]), page(), t0())
+  r200 = conditional(rq("GET", [("if-none-match", "\"v2\"")]), page(), t0())
+  r404 = conditional(rq("GET", [("if-none-match", "*")]), Response{status: 404, headers: [], body: ""}, t0())
+  ims = conditional(rq("GET", [("if-modified-since", "Fri, 16 Oct 2026 12:00:00 GMT")]), page(), at_s(60))
+  r304.status == 304 and r412.status == 412 and r412.header("etag") == some("\"v1\"") and r200.status == 200 and r404.status == 404 and ims.status == 304
+
+test etag_added_once = do
+  r = with_etag(Response{status: 200, headers: [], body: "hi"}, false)
+  r.header("etag") == some(etag_str(etag_for("hi"))) and with_etag(page(), false).header("etag") == some("\"v1\"") and with_etag(Response{status: 404, headers: [], body: "x"}, false).headers == [] and with_etag(Response{status: 200, headers: [], body: "x"}, true).header("etag").map(e => e.starts_with("W/")) == some(true)
+
+fn hello(req: Request) -> Response
+= http.text(200, "hello world")
+
+test conditional_get_wrapper = do
+  first = conditional_get(false, hello)(rq("GET", []))
+  tag = first.header("etag").or("")
+  second = conditional_get(false, hello)(rq("GET", [("if-none-match", tag)]))
+  post_ = conditional_get(false, hello)(rq("POST", [("if-none-match", tag)]))
+  first.status == 200 and tag != "" and second.status == 304 and second.body == "" and post_.status == 200 and post_.header("etag") == none
+
+test cache_control_rendering = do
+  full = cache_control() with public := true, no_store := true, max_age := some(1), s_maxage := some(2), must_revalidate := true, proxy_revalidate := true, must_understand := true, no_transform := true, immutable := true, stale_while_revalidate := some(3), stale_if_error := some(4), max_stale := some(5), min_fresh := some(6), only_if_cached := true, extensions := [("ext", ""), ("x", "a b")]
+  text = render_cache_control(full)
+  text == "public, no-store, max-age=1, s-maxage=2, must-revalidate, proxy-revalidate, must-understand, no-transform, immutable, stale-while-revalidate=3, stale-if-error=4, max-stale=5, min-fresh=6, only-if-cached, ext, x=\"a b\"" and parse_cache_control(text) == full and render_cache_control(cache_control()) == ""
+
+test cache_control_parsing = do
+  p = parse_cache_control("PRIVATE=\"Set-Cookie, X-Token\", No-Cache, max-age=abc, max-stale, s-maxage=99999999999")
+  p.private and p.private_fields == ["Set-Cookie", "X-Token"] and p.no_cache and p.no_cache_fields == [] and p.max_age == none and p.max_stale == some(2147483648) and p.s_maxage == some(2147483648) and parse_cache_control("") == cache_control() and render_cache_control(p).starts_with("private=\"Set-Cookie, X-Token\", no-cache")
+
+test response_cache_control = do
+  r = with_cache_control(page(), private_for(30))
+  cache_control_of(r).private and cache_control_of(r).max_age == some(30) and r.headers.filter(h => h.0.lower == "cache-control").len == 1 and cache_control_of(Response{status: 200, headers: [], body: ""}) == cache_control()
+
+test vary_fields = do
+  none_ = add_vary(Response{status: 200, headers: [], body: ""}, ["Accept"])
+  star = add_vary(page(), ["*"])
+  empty = add_vary(Response{status: 200, headers: [], body: ""}, [])
+  none_.header("vary") == some("Accept") and star.header("vary") == some("*") and empty.headers == [] and vary_of(add_vary(page(), ["accept-encoding", "Origin"])) == ["Accept-Encoding", "Origin"]
+
+test freshness = do
+  d = some(t0())
+  life = freshness_lifetime(parse_cache_control("max-age=60, s-maxage=600"), false, none, none)
+  exp = freshness_lifetime(cache_control(), true, d, some(format_http_date(at_s(120))))
+  bad = freshness_lifetime(cache_control(), true, d, some("0"))
+  life == some(60) and exp == some(120) and bad == some(0) and freshness_lifetime(cache_control(), true, d, none) == none
+
+test ages = current_age(0, some(t0()), at_s(5), at_s(8), at_s(20)) == 20 and current_age(0, some(at_s(100)), at_s(5), at_s(8), at_s(8)) == 3 and is_fresh(1, 0) and not is_fresh(0, 0) and age_header(0) == ("Age", "0")
+
+// The port in the server's `listening on http://127.0.0.1:PORT` line.
+fn port_in(line: Str) -> Opt[Int]
+= match line.split_once("listening on http://")
+| some((_, rest)) => rest.split(":").last.or("").chars.take_while(c => "0123456789".contains(c)).join("").to_int
+| none => none
+
+fn send(base: Str, path: Str, headers: List[(Str, Str)]) -> Response ! net
+= match http.send(http.req("GET", base + path) with headers := headers, timeout_ms := 60000)
+| ok(r) => r
+| err(e) => Response{status: 0, headers: [], body: "{e}"}
+
+fn slow_client(base: Str, ok: Atomic[Int]) -> Unit ! net, conc
+= if send(base, "/slow", []).body == "slow 1" then ok.add(1)
+
+// Starts tests/it/main.ssp in `tier` and checks what HTTP clients see: an ETag and then 304 for
+// a conditional GET, a value computed once and served from the shared cache, and single-flight
+// for 8 concurrent clients missing the same key. The lock sspur writes beside the server pins the
+// package's exports, so it is removed first.
+fn served(tier: Str) -> Bool ! proc, env, net, time, div, fs, conc
+= do
+  stale = remove_file("tests/it/sspur.lock")
+  args = ["run"] + (if tier == "interp" then ["--interp"] else []) + ["tests/it/main.ssp"]
+  match proc.spawn(env_var("SSPUR").or("sspur"), args, [])
+  | err(_) => false
+  | ok(p) => do
+    deadline = now_ms() + 600000
+    var port = 0
+    while port == 0 and now_ms() < deadline and p.running()
+      match p.line(1000)
+      | some(l) => port := port_in(l).or(0)
+      | none => ()
+    base = "http://127.0.0.1:{port}"
+    ok = port > 0
+    first = if ok then send(base, "/page", []) else Response{status: 0, headers: [], body: ""}
+    tag = first.header("etag").or("")
+    again = if ok then send(base, "/page", [("If-None-Match", tag)]) else first
+    d1 = if ok then send(base, "/data", []).body else ""
+    d2 = if ok then send(base, "/data", []).body else ""
+    good = atomic(0)
+    if ok then do
+      for i in par(0..8)
+        slow_client(base, good)
+    st = p.stop()
+    first.status == 200 and tag != "" and first.header("cache-control") == some("no-cache") and again.status == 304 and again.body == "" and again.header("etag") == some(tag) and d1 == "computed 1" and d2 == "computed 1" and good.load == 8
+
+test integration_native = served("native")
+
+test integration_interp = served("interp")

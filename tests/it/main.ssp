@@ -1,0 +1,23 @@
+// The server the integration tests start: /page with an ETag and conditional GET, /data and
+// /slow computed through the shared cache (counting how often each is computed).
+type App = {store: cache.Shared, data: Atomic[Int], slow: Atomic[Int]}
+
+fn page(req: Request) -> Response
+= cache.with_cache_control(http.html(200, "<p>hello</p>"), cache.revalidate())
+
+fn computed(n: Atomic[Int], name: Str, wait: Int) -> Str ! conc, time
+= do
+  n.add(1)
+  sleep_ms(wait)
+  "{name} {n.load}"
+
+fn route(app: App, req: Request) -> Response ! db, fail[DbErr], time, rand, div, conc
+= if req.path == "/data" then http.text(200, cache.fetch(app.store, "data", 0, cache.flight(), () => computed(app.data, "computed", 0)))
+  else if req.path == "/slow" then http.text(200, cache.fetch(app.store, "slow", 0, cache.Flight{lease_ms: 120000, wait_ms: 120000, poll_ms: 5}, () => computed(app.slow, "slow", 500)))
+  else cache.conditional_get(false, page)(req)
+
+fn main() -> Unit ! net, log, db, fail[DbErr], conc, div, rand, time
+= do
+  app = App{store: cache.shared(db.open(":memory:"), "pages", 100), data: atomic(0), slow: atomic(0)}
+  http.serve_with(http.server(0) with max_requests := 100, workers := 8, req => catch route(app, req)
+    | _ => http.text(500, "error"))
